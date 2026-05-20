@@ -1,8 +1,4 @@
-#include "../common/init_detect.h"
-#include "../common/backend.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include "systemd-shimd.h"
 
 static void print_usage(void)
 {
@@ -25,81 +21,60 @@ static void print_usage(void)
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2) {
-        print_usage();
-        return 1;
-    }
+    if (argc < 2) { print_usage(); return 1; }
 
     InitType init = detect_init_system();
-    const InitBackend *backend = get_backend(init);
-
-    if (!backend) {
-        fprintf(stderr, "systemd-shimd: unsupported init system (%s)\n",
-                init_type_name(init));
+    if (init == INIT_UNKNOWN) {
+        fprintf(stderr, "systemd-shimd: unsupported init system\n");
         return 1;
     }
 
     const char *cmd = argv[1];
 
-    if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
-        print_usage();
-        return 0;
-    }
-
-    if (strcmp(cmd, "--version") == 0) {
-        printf("systemd-shimd 0.1.0\n");
-        return 0;
-    }
+    if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) { print_usage(); return 0; }
+    if (strcmp(cmd, "--version") == 0) { printf("systemd-shimd 0.1.0\n"); return 0; }
 
     if (strcmp(cmd, "start") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl start NAME\n"); return 1; }
-        return backend->start(argv[2]);
+        return unit_start(argv[2]);
     }
-
     if (strcmp(cmd, "stop") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl stop NAME\n"); return 1; }
-        return backend->stop(argv[2]);
+        return unit_stop(argv[2]);
     }
-
     if (strcmp(cmd, "restart") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl restart NAME\n"); return 1; }
-        return backend->restart(argv[2]);
+        return unit_restart(argv[2]);
     }
-
     if (strcmp(cmd, "status") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl status NAME\n"); return 1; }
-        return backend->status(argv[2]);
+        return unit_status(argv[2]);
     }
-
     if (strcmp(cmd, "enable") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl enable NAME\n"); return 1; }
-        return backend->enable(argv[2]);
+        return unit_enable(argv[2]);
     }
-
     if (strcmp(cmd, "disable") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl disable NAME\n"); return 1; }
-        return backend->disable(argv[2]);
+        return unit_disable(argv[2]);
     }
-
     if (strcmp(cmd, "is-active") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl is-active NAME\n"); return 1; }
-        int rc = backend->is_active(argv[2]);
+        int rc = unit_is_active(argv[2]);
         printf("%s\n", rc == 0 ? "active" : "inactive");
         return rc;
     }
-
     if (strcmp(cmd, "is-enabled") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: systemctl is-enabled NAME\n"); return 1; }
-        int rc = backend->is_enabled(argv[2]);
+        int rc = unit_is_enabled(argv[2]);
         printf("%s\n", rc == 0 ? "enabled" : "disabled");
         return rc;
     }
-
     if (strcmp(cmd, "list-units") == 0) {
-        char **units = backend->list_units();
+        char **units = unit_list();
         if (!units) {
-            fprintf(stderr, "systemd-shimd: listing units not supported by %s backend\n",
-                    backend->name);
+            fprintf(stderr, "systemd-shimd: listing units not supported by %s\n",
+                    init_type_name(init));
             return 1;
         }
         printf("  UNIT                LOAD   ACTIVE     SUB\n");
@@ -110,22 +85,10 @@ int main(int argc, char *argv[])
         free(units);
         return 0;
     }
-
-    if (strcmp(cmd, "daemon-reload") == 0) {
-        return backend->daemon_reload();
-    }
-
-    if (strcmp(cmd, "reboot") == 0) {
-        return backend->reboot();
-    }
-
-    if (strcmp(cmd, "poweroff") == 0) {
-        return backend->poweroff();
-    }
-
-    if (strcmp(cmd, "halt") == 0) {
-        return backend->halt();
-    }
+    if (strcmp(cmd, "daemon-reload") == 0) return daemon_reload();
+    if (strcmp(cmd, "reboot") == 0) return system_reboot();
+    if (strcmp(cmd, "poweroff") == 0) return system_poweroff();
+    if (strcmp(cmd, "halt") == 0) return system_halt();
 
     fprintf(stderr, "systemd-shimd: unknown command '%s'\n", cmd);
     print_usage();

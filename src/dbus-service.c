@@ -1,15 +1,7 @@
-#define _GNU_SOURCE
-#include "../common/init_detect.h"
-#include "../common/backend.h"
-#include "../common/backend_helpers.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/utsname.h>
-
+#include "systemd-shimd.h"
 #include <systemd/sd-bus.h>
 #include <systemd/sd-event.h>
+#include <sys/utsname.h>
 
 #define MANAGER_PATH   "/org/freedesktop/systemd1"
 #define UNIT_PREFIX    "/org/freedesktop/systemd1/unit"
@@ -18,7 +10,6 @@
 #define PROP_IFACE     "org.freedesktop.DBus.Properties"
 
 typedef struct {
-    const InitBackend *backend;
     char version[32];
     char architecture[16];
     char features[64];
@@ -30,45 +21,27 @@ static void build_unit_path(const char *name, char **out)
     sd_bus_path_encode(UNIT_PREFIX, name, out);
 }
 
-static char *strip_suffix(const char *name)
-{
-    size_t len = strlen(name);
-    if (len > 8 && strcmp(name + len - 8, ".service") == 0) {
-        char *s = strdup(name);
-        s[len - 8] = '\0';
-        return s;
-    }
-    return strdup(name);
-}
-
 static int unit_exists(const char *name)
 {
-    char *s = strip_suffix(name);
+    char *s = strip_unit_suffix(name);
     size_t len = strlen("/etc/init.d/") + strlen(s) + 1;
     char *path = malloc(len);
     snprintf(path, len, "/etc/init.d/%s", s);
-    int rc = access(path, X_OK);
-    free(s);
-    free(path);
-    return rc == 0;
+    int rc = access(path, X_OK) == 0;
+    free(s); free(path);
+    return rc;
 }
 
 static int unit_get_active_state(const char *name, char **state)
 {
-    char *s = strip_suffix(name);
-    const char *argv[] = {"rc-service", s, "status", NULL};
-    int rc = run_cmd(argv);
-    free(s);
+    int rc = unit_status(name);
     *state = strdup(rc == 0 ? "active" : "inactive");
     return rc;
 }
 
 static int unit_get_sub_state(const char *name, char **substate)
 {
-    char *s = strip_suffix(name);
-    const char *argv[] = {"rc-service", s, "status", NULL};
-    int rc = run_cmd(argv);
-    free(s);
+    int rc = unit_status(name);
     *substate = strdup(rc == 0 ? "running" : "dead");
     return rc;
 }
@@ -80,8 +53,7 @@ static int prop_version(sd_bus *bus, const char *path, const char *iface,
                          void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    ServiceData *d = userdata;
-    return sd_bus_message_append(reply, "s", d->version);
+    return sd_bus_message_append(reply, "s", ((ServiceData *)userdata)->version);
 }
 
 static int prop_features(sd_bus *bus, const char *path, const char *iface,
@@ -97,8 +69,7 @@ static int prop_architecture(sd_bus *bus, const char *path, const char *iface,
                               void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    ServiceData *d = userdata;
-    return sd_bus_message_append(reply, "s", d->architecture);
+    return sd_bus_message_append(reply, "s", ((ServiceData *)userdata)->architecture);
 }
 
 static int prop_tainted(sd_bus *bus, const char *path, const char *iface,
@@ -130,16 +101,14 @@ static int prop_empty_string(sd_bus *bus, const char *path, const char *iface,
 static int method_start_unit(sd_bus_message *m, void *userdata,
                               sd_bus_error *ret_error)
 {
+    (void)userdata;
     const char *name, *mode;
     int r = sd_bus_message_read(m, "ss", &name, &mode);
     if (r < 0) return r;
-
-    ServiceData *d = userdata;
-    r = d->backend->start(name);
+    r = unit_start(name);
     if (r != 0)
         return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.Error.Failed",
                                  "Failed to start unit '%s'", name);
-
     char *unit_path;
     build_unit_path(name, &unit_path);
     r = sd_bus_reply_method_return(m, "o", unit_path);
@@ -150,16 +119,14 @@ static int method_start_unit(sd_bus_message *m, void *userdata,
 static int method_stop_unit(sd_bus_message *m, void *userdata,
                              sd_bus_error *ret_error)
 {
+    (void)userdata;
     const char *name, *mode;
     int r = sd_bus_message_read(m, "ss", &name, &mode);
     if (r < 0) return r;
-
-    ServiceData *d = userdata;
-    r = d->backend->stop(name);
+    r = unit_stop(name);
     if (r != 0)
         return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.Error.Failed",
                                  "Failed to stop unit '%s'", name);
-
     char *unit_path;
     build_unit_path(name, &unit_path);
     r = sd_bus_reply_method_return(m, "o", unit_path);
@@ -170,16 +137,14 @@ static int method_stop_unit(sd_bus_message *m, void *userdata,
 static int method_restart_unit(sd_bus_message *m, void *userdata,
                                 sd_bus_error *ret_error)
 {
+    (void)userdata;
     const char *name, *mode;
     int r = sd_bus_message_read(m, "ss", &name, &mode);
     if (r < 0) return r;
-
-    ServiceData *d = userdata;
-    r = d->backend->restart(name);
+    r = unit_restart(name);
     if (r != 0)
         return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.Error.Failed",
                                  "Failed to restart unit '%s'", name);
-
     char *unit_path;
     build_unit_path(name, &unit_path);
     r = sd_bus_reply_method_return(m, "o", unit_path);
@@ -190,10 +155,9 @@ static int method_restart_unit(sd_bus_message *m, void *userdata,
 static int method_reload_unit(sd_bus_message *m, void *userdata,
                                sd_bus_error *ret_error)
 {
-    (void)m;
+    (void)m; (void)userdata;
     return sd_bus_error_setf(ret_error, "org.freedesktop.systemd1.Error.Failed",
-                             "ReloadUnit not supported by the %s backend",
-                             ((ServiceData *)userdata)->backend->name);
+                             "ReloadUnit not supported");
 }
 
 static int method_get_unit(sd_bus_message *m, void *userdata,
@@ -203,12 +167,10 @@ static int method_get_unit(sd_bus_message *m, void *userdata,
     const char *name;
     int r = sd_bus_message_read(m, "s", &name);
     if (r < 0) return r;
-
     if (!unit_exists(name))
         return sd_bus_error_setf(ret_error,
                 "org.freedesktop.systemd1.Error.UnitNotFound",
                 "Unit '%s' not found", name);
-
     char *unit_path;
     build_unit_path(name, &unit_path);
     r = sd_bus_reply_method_return(m, "o", unit_path);
@@ -234,56 +196,38 @@ static int method_list_units(sd_bus_message *m, void *userdata,
                               sd_bus_error *ret_error)
 {
     (void)ret_error;
-    ServiceData *d = userdata;
-    char **units = d->backend->list_units();
+    (void)userdata;
+    char **units = unit_list();
     if (!units)
         return sd_bus_reply_method_return(m, "a(ssssssouso)", 0);
 
     sd_bus_message *reply = NULL;
     int r = sd_bus_message_new_method_return(m, &reply);
-    if (r < 0) { d->backend->list_units(); return r; }
+    if (r < 0) goto cleanup;
 
     r = sd_bus_message_open_container(reply, 'a', "(ssssssouso)");
-    if (r < 0) { d->backend->list_units(); return r; }
+    if (r < 0) goto cleanup;
 
     for (int i = 0; units[i]; i++) {
         const char *name = units[i];
-        char *sname = strip_suffix(name);
-        char active[16], substate[16];
-        snprintf(active,   sizeof(active),   "active");
-        snprintf(substate, sizeof(substate), "running");
-
+        char *sname = strip_unit_suffix(name);
         char *unit_path;
         build_unit_path(name, &unit_path);
-
         r = sd_bus_message_append(reply, "(ssssssouso)",
-            name,           /* Id */
-            sname,          /* Description */
-            "loaded",       /* LoadState */
-            active,         /* ActiveState */
-            substate,       /* SubState */
-            "",             /* Following */
-            unit_path,      /* object path */
-            (uint32_t)0,    /* job id */
-            "",             /* job type */
-            "/"             /* job object path */
-        );
+            name, sname, "loaded", "active", "running",
+            "", unit_path, (uint32_t)0, "", "/");
         free(unit_path);
         free(sname);
         if (r < 0) break;
     }
 
-    /* Cleanup units list */
+    if (r >= 0) r = sd_bus_message_close_container(reply);
+    if (r >= 0) r = sd_bus_send(NULL, reply, NULL);
+
+cleanup:
+    if (reply) sd_bus_message_unref(reply);
     for (int i = 0; units[i]; i++) free(units[i]);
     free(units);
-
-    if (r < 0) { sd_bus_message_unref(reply); return r; }
-
-    r = sd_bus_message_close_container(reply);
-    if (r < 0) { sd_bus_message_unref(reply); return r; }
-
-    r = sd_bus_send(NULL, reply, NULL);
-    sd_bus_message_unref(reply);
     return r;
 }
 
@@ -291,70 +235,56 @@ static int method_list_unit_files(sd_bus_message *m, void *userdata,
                                    sd_bus_error *ret_error)
 {
     (void)ret_error;
-    ServiceData *d = userdata;
-    char **units = d->backend->list_units();
+    (void)userdata;
+    char **units = unit_list();
     if (!units)
         return sd_bus_reply_method_return(m, "a(ss)", 0);
 
     sd_bus_message *reply = NULL;
     int r = sd_bus_message_new_method_return(m, &reply);
-    if (r < 0) { for (int i = 0; units[i]; i++) free(units[i]); free(units); return r; }
+    if (r < 0) goto cleanup;
 
     r = sd_bus_message_open_container(reply, 'a', "(ss)");
-    if (r < 0) { for (int i = 0; units[i]; i++) free(units[i]); free(units); return r; }
+    if (r < 0) goto cleanup;
 
     for (int i = 0; units[i]; i++) {
-        char *state = NULL;
-        if (d->backend->is_enabled(units[i]) == 0)
-            state = "enabled";
-        else
-            state = "disabled";
-
+        const char *state = unit_is_enabled(units[i]) == 0 ? "enabled" : "disabled";
         size_t len = strlen("/etc/init.d/") + strlen(units[i]) + 1;
         char *path = malloc(len);
         snprintf(path, len, "/etc/init.d/%s", units[i]);
-
         r = sd_bus_message_append(reply, "(ss)", path, state);
         free(path);
         if (r < 0) break;
     }
 
+    if (r >= 0) r = sd_bus_message_close_container(reply);
+    if (r >= 0) r = sd_bus_send(NULL, reply, NULL);
+
+cleanup:
+    if (reply) sd_bus_message_unref(reply);
     for (int i = 0; units[i]; i++) free(units[i]);
     free(units);
-
-    if (r < 0) { sd_bus_message_unref(reply); return r; }
-
-    r = sd_bus_message_close_container(reply);
-    if (r < 0) { sd_bus_message_unref(reply); return r; }
-
-    r = sd_bus_send(NULL, reply, NULL);
-    sd_bus_message_unref(reply);
     return r;
 }
 
 static int method_get_unit_file_state(sd_bus_message *m, void *userdata,
                                        sd_bus_error *ret_error)
 {
-    (void)ret_error;
+    (void)ret_error; (void)userdata;
     const char *file;
     int r = sd_bus_message_read(m, "s", &file);
     if (r < 0) return r;
-
-    ServiceData *d = userdata;
-    const char *state = d->backend->is_enabled(file) == 0 ? "enabled" : "disabled";
+    const char *state = unit_is_enabled(file) == 0 ? "enabled" : "disabled";
     return sd_bus_reply_method_return(m, "s", state);
 }
 
 static int method_enable_unit_files(sd_bus_message *m, void *userdata,
                                      sd_bus_error *ret_error)
 {
-    (void)ret_error;
+    (void)ret_error; (void)userdata;
     int runtime, force;
     int r = sd_bus_message_read(m, "abb", &runtime, &force);
     if (r < 0) return r;
-
-    ServiceData *d = userdata;
-    int carries = 0;
 
     sd_bus_message *reply = NULL;
     r = sd_bus_message_new_method_return(m, &reply);
@@ -363,17 +293,16 @@ static int method_enable_unit_files(sd_bus_message *m, void *userdata,
     r = sd_bus_message_open_container(reply, 'a', "(ss)");
     if (r < 0) { sd_bus_message_unref(reply); return r; }
 
+    int carries = 0;
     const char *file;
     r = sd_bus_message_enter_container(m, 'a', "s");
     if (r < 0) { sd_bus_message_unref(reply); return r; }
 
     while ((r = sd_bus_message_read_basic(m, 's', &file)) > 0) {
-        int rc = d->backend->enable(file);
+        int rc = unit_enable(file);
         if (rc == 0) carries = 1;
-        sd_bus_message_append(reply, "(ss)",
-            rc == 0 ? "symlink" : "error", file);
+        sd_bus_message_append(reply, "(ss)", rc == 0 ? "symlink" : "error", file);
     }
-
     sd_bus_message_exit_container(m);
 
     r = sd_bus_message_close_container(reply);
@@ -388,13 +317,10 @@ static int method_enable_unit_files(sd_bus_message *m, void *userdata,
 static int method_disable_unit_files(sd_bus_message *m, void *userdata,
                                       sd_bus_error *ret_error)
 {
-    (void)ret_error;
+    (void)ret_error; (void)userdata;
     int runtime;
     int r = sd_bus_message_read(m, "ab", &runtime);
     if (r < 0) return r;
-
-    ServiceData *d = userdata;
-    int carries = 0;
 
     sd_bus_message *reply = NULL;
     r = sd_bus_message_new_method_return(m, &reply);
@@ -403,17 +329,16 @@ static int method_disable_unit_files(sd_bus_message *m, void *userdata,
     r = sd_bus_message_open_container(reply, 'a', "(ss)");
     if (r < 0) { sd_bus_message_unref(reply); return r; }
 
+    int carries = 0;
     const char *file;
     r = sd_bus_message_enter_container(m, 'a', "s");
     if (r < 0) { sd_bus_message_unref(reply); return r; }
 
     while ((r = sd_bus_message_read_basic(m, 's', &file)) > 0) {
-        int rc = d->backend->disable(file);
+        int rc = unit_disable(file);
         if (rc == 0) carries = 1;
-        sd_bus_message_append(reply, "(ss)",
-            rc == 0 ? "symlink" : "error", file);
+        sd_bus_message_append(reply, "(ss)", rc == 0 ? "symlink" : "error", file);
     }
-
     sd_bus_message_exit_container(m);
 
     r = sd_bus_message_close_container(reply);
@@ -428,8 +353,8 @@ static int method_disable_unit_files(sd_bus_message *m, void *userdata,
 static int method_reload(sd_bus_message *m, void *userdata,
                           sd_bus_error *ret_error)
 {
-    (void)ret_error;
-    ((ServiceData *)userdata)->backend->daemon_reload();
+    (void)ret_error; (void)userdata;
+    daemon_reload();
     return sd_bus_reply_method_return(m, "");
 }
 
@@ -456,19 +381,13 @@ static int unit_find(sd_bus *bus, const char *path, const char *interface,
     if (!name)
         return sd_bus_error_setf(ret_error, SD_BUS_ERROR_FAILED,
                                  "Failed to decode unit path: %s", path);
-
-    if (!unit_exists(name)) {
-        free(name);
-        return 0;
-    }
+    if (!unit_exists(name)) { free(name); return 0; }
 
     struct UnitInfo *info = calloc(1, sizeof(struct UnitInfo));
     strncpy(info->name, name, sizeof(info->name) - 1);
-    char *s = strip_suffix(name);
+    char *s = strip_unit_suffix(name);
     strncpy(info->stripped, s, sizeof(info->stripped) - 1);
-    free(s);
-    free(name);
-
+    free(s); free(name);
     *ret_found = info;
     return 1;
 }
@@ -478,8 +397,7 @@ static int unit_prop_id(sd_bus *bus, const char *path, const char *iface,
                          void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    struct UnitInfo *info = userdata;
-    return sd_bus_message_append(reply, "s", info->name);
+    return sd_bus_message_append(reply, "s", ((struct UnitInfo *)userdata)->name);
 }
 
 static int unit_prop_description(sd_bus *bus, const char *path, const char *iface,
@@ -487,8 +405,7 @@ static int unit_prop_description(sd_bus *bus, const char *path, const char *ifac
                                   void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    struct UnitInfo *info = userdata;
-    return sd_bus_message_append(reply, "s", info->stripped);
+    return sd_bus_message_append(reply, "s", ((struct UnitInfo *)userdata)->stripped);
 }
 
 static int unit_prop_load_state(sd_bus *bus, const char *path, const char *iface,
@@ -504,9 +421,8 @@ static int unit_prop_active_state(sd_bus *bus, const char *path, const char *ifa
                                    void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    struct UnitInfo *info = userdata;
     char *state = NULL;
-    unit_get_active_state(info->name, &state);
+    unit_get_active_state(((struct UnitInfo *)userdata)->name, &state);
     int r = sd_bus_message_append(reply, "s", state ? state : "inactive");
     free(state);
     return r;
@@ -517,9 +433,8 @@ static int unit_prop_sub_state(sd_bus *bus, const char *path, const char *iface,
                                 void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    struct UnitInfo *info = userdata;
     char *state = NULL;
-    unit_get_sub_state(info->name, &state);
+    unit_get_sub_state(((struct UnitInfo *)userdata)->name, &state);
     int r = sd_bus_message_append(reply, "s", state ? state : "dead");
     free(state);
     return r;
@@ -530,10 +445,10 @@ static int unit_prop_path(sd_bus *bus, const char *path, const char *iface,
                            void *userdata, sd_bus_error *ret_error)
 {
     (void)bus; (void)path; (void)iface; (void)prop; (void)ret_error;
-    struct UnitInfo *info = userdata;
-    size_t len = strlen("/etc/init.d/") + strlen(info->stripped) + 1;
+    const char *stripped = ((struct UnitInfo *)userdata)->stripped;
+    size_t len = strlen("/etc/init.d/") + strlen(stripped) + 1;
     char *fp = malloc(len);
-    snprintf(fp, len, "/etc/init.d/%s", info->stripped);
+    snprintf(fp, len, "/etc/init.d/%s", stripped);
     int r = sd_bus_message_append(reply, "s", fp);
     free(fp);
     return r;
@@ -554,12 +469,9 @@ static int enumerate_units(sd_bus *bus, const char *prefix,
                             sd_bus_error *ret_error)
 {
     (void)bus; (void)prefix; (void)ret_error;
-    ServiceData *d = userdata;
-    char **units = d->backend->list_units();
-    if (!units) {
-        *ret_nodes = NULL;
-        return 0;
-    }
+    (void)userdata;
+    char **units = unit_list();
+    if (!units) { *ret_nodes = NULL; return 0; }
 
     size_t count = 0;
     for (int i = 0; units[i]; i++) count++;
@@ -632,30 +544,22 @@ static const sd_bus_vtable unit_vtable[] = {
 int main(int argc, char *argv[])
 {
     InitType init = detect_init_system();
-    const InitBackend *backend = get_backend(init);
-    if (!backend) {
-        fprintf(stderr, "systemd-shimd: unsupported init system (%s)\n",
-                init_type_name(init));
+    if (init == INIT_UNKNOWN) {
+        fprintf(stderr, "systemd-shimd: unsupported init system\n");
         return 1;
     }
 
-    ServiceData data = { .backend = backend };
+    ServiceData data;
     snprintf(data.version, sizeof(data.version), "systemd-shimd 0.1.0");
     data.features[0] = '\0';
-
     struct utsname uts;
     uname(&uts);
     strncpy(data.architecture, uts.machine, sizeof(data.architecture) - 1);
-
-    if (argc > 1 && strcmp(argv[1], "--bus") == 0) {
-        fprintf(stderr, "systemd-shimd: running systemctl in D-Bus mode...\n");
-    }
 
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
         printf("systemd-shimd 0.1.0\n");
         return 0;
     }
-
     if (argc > 1 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         printf("Usage: systemd-shimd [--bus|--version|--help]\n");
         printf("\nD-BUS service implementing org.freedesktop.systemd1\n");
@@ -699,7 +603,6 @@ int main(int argc, char *argv[])
 
     r = sd_bus_add_fallback_vtable(bus, NULL, UNIT_PREFIX, PROP_IFACE,
                                    unit_vtable, unit_find, &data);
-    /* Best-effort: not critical if this fails */
 
     r = sd_bus_request_name(bus, "org.freedesktop.systemd1", 0);
     if (r < 0) {
@@ -710,15 +613,14 @@ int main(int argc, char *argv[])
     }
 
     fprintf(stderr, "systemd-shimd: running as org.freedesktop.systemd1 (%s backend)\n",
-            backend->name);
+            init_type_name(init));
 
     sd_event *event = NULL;
     sd_event_new(&event);
     sd_bus_attach_event(bus, event, SD_EVENT_PRIORITY_NORMAL);
     r = sd_event_loop(event);
-    if (r < 0) {
+    if (r < 0)
         fprintf(stderr, "systemd-shimd: event loop failed: %s\n", strerror(-r));
-    }
 
     sd_event_unref(event);
     sd_bus_unref(bus);
