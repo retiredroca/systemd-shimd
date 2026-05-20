@@ -17,6 +17,8 @@ typedef enum {
     INIT_SYSV,
 } InitType;
 
+#define MASK_DIR "/etc/systemd-shimd/masked"
+
 static inline const char *init_type_name(InitType t)
 {
     switch (t) {
@@ -139,6 +141,15 @@ static inline int unit_start(const char *name)
 {
     InitType t = detect_init_system();
     char *s = strip_unit_suffix(name);
+    size_t mpl = strlen(MASK_DIR) + 1 + strlen(s) + 1;
+    char *mp = malloc(mpl); snprintf(mp, mpl, "%s/%s", MASK_DIR, s);
+    int masked = access(mp, F_OK) == 0;
+    free(mp);
+    if (masked) {
+        fprintf(stderr, "Unit %s is masked.\n", s);
+        free(s);
+        return 1;
+    }
     int rc;
     switch (t) {
     case INIT_OPENRC: {
@@ -522,3 +533,178 @@ static inline int system_halt(void)
     default: return -1;
     }
 }
+
+/* ── Compatibility operations (package post-install) ─────────── */
+
+static inline int unit_mask(const char *name)
+{
+    char *s = strip_unit_suffix(name);
+    mkdir("/etc/systemd-shimd", 0755);
+    mkdir(MASK_DIR, 0755);
+    size_t pl = strlen(MASK_DIR) + 1 + strlen(s) + 1;
+    char *p = malloc(pl); snprintf(p, pl, "%s/%s", MASK_DIR, s);
+    FILE *f = fopen(p, "w");
+    int rc = f ? 0 : 1;
+    if (f) fclose(f);
+    free(p); free(s);
+    return rc;
+}
+
+static inline int unit_unmask(const char *name)
+{
+    char *s = strip_unit_suffix(name);
+    size_t pl = strlen(MASK_DIR) + 1 + strlen(s) + 1;
+    char *p = malloc(pl); snprintf(p, pl, "%s/%s", MASK_DIR, s);
+    int rc = unlink(p) == 0 ? 0 : 1;
+    free(p); free(s);
+    return rc;
+}
+
+static inline int unit_try_restart(const char *name)
+{
+    if (unit_is_active(name) == 0) return unit_restart(name);
+    return 0;
+}
+
+static inline int unit_reload(const char *name)
+{
+    InitType t = detect_init_system();
+    char *s = strip_unit_suffix(name);
+    int rc;
+    switch (t) {
+    case INIT_OPENRC: {
+        const char *a[] = {"rc-service", s, "reload", NULL};
+        rc = run_cmd(a);
+        break;
+    }
+    case INIT_RUNIT: {
+        const char *a[] = {"sv", "reload", s, NULL};
+        rc = run_cmd(a);
+        break;
+    }
+    case INIT_S6:
+    case INIT_SYSV: {
+        /* reload not available; fall through to restart */
+        rc = -1;
+        break;
+    }
+    default: rc = -1;
+    }
+    free(s);
+    if (rc != 0) rc = unit_restart(name);
+    return rc;
+}
+
+static inline int unit_reenable(const char *name)
+{
+    int rc = unit_disable(name);
+    rc |= unit_enable(name);
+    return rc;
+}
+
+static inline int unit_is_failed(const char *name)
+{
+    (void)name;
+    return 1;
+}
+
+static inline int unit_kill(const char *name, const char *signal)
+{
+    char *s = strip_unit_suffix(name);
+    char cmd[768];
+    snprintf(cmd, sizeof(cmd),
+        "p=$(cat /var/run/%s.pid 2>/dev/null; "
+        "cat /run/%s.pid 2>/dev/null); "
+        "[ -n \"$p\" ] && kill -s %s $p 2>/dev/null || true",
+        s, s, signal);
+    const char *a[] = {"sh", "-c", cmd, NULL};
+    int rc = run_cmd(a);
+    free(s);
+    return rc;
+}
+
+static inline int unit_daemon_reexec(void)
+{
+    return 0;
+}
+
+static inline int unit_reset_failed(const char *name)
+{
+    (void)name;
+    return 0;
+}
+
+static inline int unit_link(const char *path)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    char *s = strip_unit_suffix(base);
+    size_t pl = strlen("/etc/init.d/") + strlen(s) + 1;
+    char *p = malloc(pl); snprintf(p, pl, "/etc/init.d/%s", s);
+    int rc = 0;
+    if (symlink(path, p) != 0) { perror("symlink"); rc = 1; }
+    free(p); free(s);
+    return rc;
+}
+
+static inline int unit_preset(const char *name)
+{
+    return unit_enable(name);
+}
+
+static inline int unit_reload_or_restart(const char *name)
+{
+    int rc = unit_reload(name);
+    if (rc != 0) rc = unit_restart(name);
+    return rc;
+}
+
+static inline int unit_try_reload_or_restart(const char *name)
+{
+    if (unit_is_active(name) != 0) return 0;
+    return unit_reload_or_restart(name);
+}
+
+static inline int unit_show(const char *name)
+{
+    InitType t = detect_init_system();
+    if (!name) {
+        printf("Manager: systemd-shimd (pid %d)\n", getpid());
+        printf("Init: %s\n", init_type_name(t));
+        return 0;
+    }
+    char *s = strip_unit_suffix(name);
+    printf("Unit: %s\n", s);
+    printf("Init: %s\n", init_type_name(t));
+    free(s);
+    return 0;
+}
+
+static inline int unit_cat(const char *name)
+{
+    char *s = strip_unit_suffix(name);
+    size_t pl = strlen("/etc/init.d/") + strlen(s) + 1;
+    char *p = malloc(pl); snprintf(p, pl, "/etc/init.d/%s", s);
+    FILE *f = fopen(p, "r");
+    if (!f) { free(p); free(s); return 1; }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        fwrite(buf, 1, n, stdout);
+    fclose(f);
+    free(p); free(s);
+    return 0;
+}
+
+static inline int unit_list_files(void)
+{
+    char **units = unit_list();
+    if (!units) return 1;
+    for (int i = 0; units[i]; i++) {
+        printf("%s\n", units[i]);
+        free(units[i]);
+    }
+    free(units);
+    return 0;
+}
+
