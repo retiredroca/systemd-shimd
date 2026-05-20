@@ -137,6 +137,11 @@ static inline char *strip_unit_suffix(const char *name)
     return strdup(name);
 }
 
+/* forward declarations for systemd unit auto-generation helpers */
+static inline int init_script_exists(const char *name);
+static inline int ensure_init_script(const char *name);
+static inline int is_auto_generated(const char *path);
+
 static inline int unit_start(const char *name)
 {
     InitType t = detect_init_system();
@@ -153,6 +158,7 @@ static inline int unit_start(const char *name)
     int rc;
     switch (t) {
     case INIT_OPENRC: {
+        ensure_init_script(s);
         const char *a[] = {"rc-service", s, "start", NULL};
         rc = run_cmd(a);
         break;
@@ -187,6 +193,7 @@ static inline int unit_stop(const char *name)
     int rc;
     switch (t) {
     case INIT_OPENRC: {
+        ensure_init_script(s);
         const char *a[] = {"rc-service", s, "stop", NULL};
         rc = run_cmd(a);
         break;
@@ -221,6 +228,7 @@ static inline int unit_restart(const char *name)
     int rc;
     switch (t) {
     case INIT_OPENRC: {
+        ensure_init_script(s);
         const char *a[] = {"rc-service", s, "restart", NULL};
         rc = run_cmd(a);
         break;
@@ -255,6 +263,7 @@ static inline int unit_status(const char *name)
     int rc;
     switch (t) {
     case INIT_OPENRC: {
+        ensure_init_script(s);
         const char *a[] = {"rc-service", s, "status", NULL};
         rc = run_cmd(a);
         break;
@@ -289,6 +298,7 @@ static inline int unit_enable(const char *name)
     int rc;
     switch (t) {
     case INIT_OPENRC: {
+        ensure_init_script(s);
         const char *a[] = {"rc-update", "add", s, NULL};
         rc = run_cmd(a);
         break;
@@ -327,6 +337,12 @@ static inline int unit_disable(const char *name)
     case INIT_OPENRC: {
         const char *a[] = {"rc-update", "delete", s, NULL};
         rc = run_cmd(a);
+        if (rc == 0) {
+            size_t pl = strlen("/etc/init.d/") + strlen(s) + 1;
+            char *p = malloc(pl); snprintf(p, pl, "/etc/init.d/%s", s);
+            if (is_auto_generated(p)) unlink(p);
+            free(p);
+        }
         break;
     }
     case INIT_RUNIT: {
@@ -534,6 +550,231 @@ static inline int system_halt(void)
     }
 }
 
+/* ── Systemd unit file helpers ─────────────────────────────── */
+
+static inline char *find_unit_file(const char *name)
+{
+    static const char *dirs[] = {
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/lib/systemd/system",
+        NULL
+    };
+    char *s = strip_unit_suffix(name);
+    for (int i = 0; dirs[i]; i++) {
+        size_t pl = strlen(dirs[i]) + strlen(s) + 17;
+        char *p = malloc(pl);
+        snprintf(p, pl, "%s/%s.service", dirs[i], s);
+        if (access(p, F_OK) == 0) { free(s); return p; }
+        free(p);
+    }
+    free(s);
+    return NULL;
+}
+
+static inline char *trim_ws(char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    char *end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+    *end = '\0';
+    return s;
+}
+
+static inline char *parse_value(const char *line)
+{
+    const char *eq = strchr(line, '=');
+    if (!eq) return NULL;
+    char *v = strdup(eq + 1);
+    v = trim_ws(v);
+    char *c = v;
+    int inq = 0;
+    while (*c) {
+        if (*c == '"') inq = !inq;
+        if (!inq && (*c == '#' || *c == ';')) { *c = '\0'; break; }
+        c++;
+    }
+    v = trim_ws(v);
+    return v;
+}
+
+static inline int generate_init_script(const char *name, const char *unit_path)
+{
+    FILE *f = fopen(unit_path, "r");
+    if (!f) return 1;
+
+    char *desc = NULL, *exec_start = NULL, *exec_stop = NULL, *exec_reload = NULL;
+    char *type = NULL, *pidfile = NULL, *user = NULL, *group = NULL, *wdir = NULL;
+    char *restart = NULL, *env = NULL;
+    int in_unit = 0, in_service = 0;
+    char buf[4096], cont[4096] = {0};
+
+    while (fgets(buf, sizeof(buf), f)) {
+        chomp(buf);
+        char *line = trim_ws(buf);
+        if (!line[0] || line[0] == '#' || line[0] == ';') continue;
+
+        if (line[0] == '[') {
+            in_unit = (strcmp(line, "[Unit]") == 0);
+            in_service = (strcmp(line, "[Service]") == 0);
+            continue;
+        }
+
+        size_t llen = strlen(line);
+        if (llen > 0 && line[llen - 1] == '\\') {
+            line[llen - 1] = '\0';
+            strcat(cont, line);
+            strcat(cont, "\n");
+            continue;
+        }
+        if (cont[0]) {
+            strcat(cont, line);
+            line = cont;
+        }
+
+        if (in_unit) {
+            if (strncmp(line, "Description=", 12) == 0) { free(desc); desc = parse_value(line); }
+        } else if (in_service) {
+            if (strncmp(line, "ExecStart=", 10) == 0) { free(exec_start); exec_start = parse_value(line); }
+            else if (strncmp(line, "ExecStop=", 9) == 0) { free(exec_stop); exec_stop = parse_value(line); }
+            else if (strncmp(line, "ExecReload=", 11) == 0) { free(exec_reload); exec_reload = parse_value(line); }
+            else if (strncmp(line, "Type=", 5) == 0) { free(type); type = parse_value(line); }
+            else if (strncmp(line, "PIDFile=", 8) == 0) { free(pidfile); pidfile = parse_value(line); }
+            else if (strncmp(line, "User=", 5) == 0) { free(user); user = parse_value(line); }
+            else if (strncmp(line, "Group=", 6) == 0) { free(group); group = parse_value(line); }
+            else if (strncmp(line, "WorkingDirectory=", 17) == 0) { free(wdir); wdir = parse_value(line); }
+            else if (strncmp(line, "Restart=", 8) == 0) { free(restart); restart = parse_value(line); }
+            else if (strncmp(line, "Environment=", 12) == 0) { free(env); env = parse_value(line); }
+        }
+        memset(cont, 0, sizeof(cont));
+    }
+    fclose(f);
+
+    if (!exec_start || !exec_start[0]) {
+        free(desc); free(exec_start); free(exec_stop); free(exec_reload); free(type);
+        free(pidfile); free(user); free(group); free(wdir); free(restart); free(env);
+        return 1;
+    }
+
+    while (*exec_start == '@' || *exec_start == '!' || *exec_start == '-')
+        memmove(exec_start, exec_start + 1, strlen(exec_start));
+
+    char *cmd = exec_start;
+    char *args = strchr(exec_start, ' ');
+    if (args) { *args = '\0'; args = trim_ws(args + 1); }
+    if (!type) type = strdup("simple");
+
+    size_t pl = strlen("/etc/init.d/") + strlen(name) + 1;
+    char *path = malloc(pl); snprintf(path, pl, "/etc/init.d/%s", name);
+
+    int rc = 0;
+    FILE *out = fopen(path, "w");
+    if (!out) { free(path); rc = 1; goto cleanup; }
+
+    fprintf(out, "#!/sbin/openrc-run\n");
+    fprintf(out, "# Auto-generated by systemd-shimd from %s\n", unit_path);
+    if (desc) fprintf(out, "description=\"%s\"\n", desc);
+
+    if (strcmp(type, "oneshot") == 0) {
+        fprintf(out, "command=\"%s\"\n", cmd);
+        if (args) fprintf(out, "command_args=\"%s\"\n", args);
+    } else if (strcmp(type, "forking") == 0) {
+        fprintf(out, "command=\"%s\"\n", cmd);
+        if (args) fprintf(out, "command_args=\"%s\"\n", args);
+        fprintf(out, "command_background=true\n");
+        fprintf(out, "pidfile=\"%s\"\n", pidfile ? pidfile : "/run/${RC_SVCNAME}.pid");
+    } else {
+        fprintf(out, "command=\"%s\"\n", cmd);
+        if (args) fprintf(out, "command_args=\"%s\"\n", args);
+        fprintf(out, "supervisor=\"supervise-daemon\"\n");
+    }
+
+    if (user && group)
+        fprintf(out, "command_user=\"%s:%s\"\n", user, group);
+    else if (user)
+        fprintf(out, "command_user=\"%s\"\n", user);
+    else if (group)
+        fprintf(out, "command_user=\"root:%s\"\n", group);
+
+    if (wdir) fprintf(out, "directory=\"%s\"\n", wdir);
+
+    if (env) {
+        fprintf(out, "\n");
+        char *e = env;
+        while (e && *e) {
+            while (*e == ' ') e++;
+            if (!*e) break;
+            char *sp = strchr(e, ' ');
+            if (sp) *sp = '\0';
+            fprintf(out, "export %s\n", e);
+            if (sp) { *sp = ' '; e = sp + 1; } else break;
+        }
+    }
+
+    fprintf(out, "\ndepend() {\n    use logger\n}\n");
+
+    if (exec_stop && strcmp(type, "oneshot") != 0) {
+        fprintf(out, "\nstop() {\n    ebegin \"Stopping ${SVCNAME}\"\n");
+        fprintf(out, "    start-stop-daemon --stop --exec \"%s\"", cmd);
+        if (pidfile) fprintf(out, " --pidfile \"%s\"", pidfile);
+        fprintf(out, "\n    eend $?\n}\n");
+    }
+
+    if (exec_reload) {
+        char *rcmd = exec_reload;
+        char *rargs = strchr(exec_reload, ' ');
+        if (rargs) { *rargs = '\0'; rargs = trim_ws(rargs + 1); }
+        fprintf(out, "\nreload() {\n    ebegin \"Reloading ${SVCNAME}\"\n");
+        fprintf(out, "    start-stop-daemon --signal HUP --exec \"%s\"", rcmd);
+        if (pidfile) fprintf(out, " --pidfile \"%s\"", pidfile);
+        fprintf(out, "\n    eend $?\n}\n");
+        if (rargs) *rargs = ' ';
+    }
+
+    fclose(out);
+    chmod(path, 0755);
+
+    free(path);
+cleanup:
+    free(desc); free(exec_start); free(exec_stop); free(exec_reload);
+    free(type); free(pidfile); free(user); free(group); free(wdir); free(restart); free(env);
+    return rc;
+}
+
+static inline int init_script_exists(const char *name)
+{
+    char *s = strip_unit_suffix(name);
+    size_t pl = strlen("/etc/init.d/") + strlen(s) + 1;
+    char *p = malloc(pl); snprintf(p, pl, "/etc/init.d/%s", s);
+    int rc = access(p, F_OK) == 0 ? 0 : 1;
+    free(p); free(s);
+    return rc;
+}
+
+static inline int ensure_init_script(const char *name)
+{
+    if (init_script_exists(name) == 0) return 0;
+    if (detect_init_system() != INIT_OPENRC) return 1;
+    char *s = strip_unit_suffix(name);
+    char *unit = find_unit_file(s);
+    if (!unit) { free(s); return 1; }
+    int rc = generate_init_script(s, unit);
+    free(unit); free(s);
+    return rc;
+}
+
+static inline int is_auto_generated(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[128];
+    int rc = 0;
+    if (fgets(buf, sizeof(buf), f) && strstr(buf, "Auto-generated by systemd-shimd"))
+        rc = 1;
+    fclose(f);
+    return rc;
+}
+
 /* ── Compatibility operations (package post-install) ─────────── */
 
 static inline int unit_mask(const char *name)
@@ -573,6 +814,7 @@ static inline int unit_reload(const char *name)
     int rc;
     switch (t) {
     case INIT_OPENRC: {
+        ensure_init_script(s);
         const char *a[] = {"rc-service", s, "reload", NULL};
         rc = run_cmd(a);
         break;
@@ -676,6 +918,11 @@ static inline int unit_show(const char *name)
     char *s = strip_unit_suffix(name);
     printf("Unit: %s\n", s);
     printf("Init: %s\n", init_type_name(t));
+    printf("Has init script: %s\n", init_script_exists(s) == 0 ? "yes" : "no");
+    char *u = find_unit_file(s);
+    printf("Has systemd unit: %s\n", u ? "yes" : "no");
+    if (u) printf("Systemd unit path: %s\n", u);
+    free(u);
     free(s);
     return 0;
 }
@@ -686,7 +933,15 @@ static inline int unit_cat(const char *name)
     size_t pl = strlen("/etc/init.d/") + strlen(s) + 1;
     char *p = malloc(pl); snprintf(p, pl, "/etc/init.d/%s", s);
     FILE *f = fopen(p, "r");
-    if (!f) { free(p); free(s); return 1; }
+    if (!f) {
+        char *u = find_unit_file(s);
+        if (u) {
+            free(p);
+            p = u;
+            f = fopen(p, "r");
+        }
+        if (!f) { free(p); free(s); return 1; }
+    }
     char buf[4096];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
