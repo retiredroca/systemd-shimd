@@ -32,7 +32,7 @@ int sd_id128_get_machine(sd_id128_t *ret);
 int sd_id128_get_boot(sd_id128_t *ret);
 int sd_id128_get_invocation(sd_id128_t *ret);
 
-char *sd_id128_to_string(sd_id128_t id, char s[static 33]);
+char *sd_id128_to_string(sd_id128_t id, char s[33]);
 int sd_id128_from_string(const char *s, sd_id128_t *ret);
 
 _SD_END_DECLARATIONS;
