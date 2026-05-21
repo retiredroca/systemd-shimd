@@ -1,6 +1,6 @@
-# systemd-shimd
+# systemd-free systemd | systemd-shimd
 
-A lightweight systemd compatibility layer for non-systemd Linux distributions.
+A lightweight systemd compatibility layer for systemd-free Linux distributions.
 Translates systemd commands and D-Bus calls into equivalent operations for the
 host init system (OpenRC, Runit, s6, sysvinit).
 
